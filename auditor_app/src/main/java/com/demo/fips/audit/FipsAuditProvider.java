@@ -1,11 +1,17 @@
 package com.demo.fips.audit;
 
-import java.security.NoSuchAlgorithmException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.lang.instrument.Instrumentation;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.security.Provider;
 import java.security.Security;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.FileHandler;
 import java.util.logging.Formatter;
@@ -36,12 +42,27 @@ import java.util.logging.Logger;
  * chain &mdash; this avoids the StackOverflowError caused by its internal
  * circular SecureRandom bootstrap.</p>
  *
+ * <p>Designed as a <b>Java agent</b> for zero-touch attachment to any
+ * Java application.  The agent's {@code premain()} inserts this provider
+ * at JCA position 1 before the application starts, leaving the JDK's
+ * default {@code java.security} configuration completely untouched.</p>
+ *
  * <pre>
- * JVM arguments:
- *   -Djava.security.properties==security-audit.properties
+ * Primary usage (Java agent — recommended):
+ *   -javaagent:/path/to/fips-audit-provider.jar
  *   -Dorg.bouncycastle.fips.approved_only=true
- *   -Dfips.audit.log=C:\path\to\fips-audit.log   (default: fips-audit.log)
- *   -Dfips.audit.stack.depth=30                   (default: 20)
+ *   -Dfips.audit.log=/path/to/fips-audit.log
+ *   -Dfips.audit.stack.depth=30
+ *   -Dfips.audit.dedupe=true
+ *
+ * To enable the BCFIPS approved-mode probe (Layer 1), also add:
+ *   -Xbootclasspath/a:/path/to/bc-fips-2.0.0.jar
+ *   (without it, only policy-file rules in fips-policy.properties apply)
+ *
+ * Alternative usage (security properties — NOT recommended):
+ *   -Djava.security.properties=security-audit.properties
+ *     WARNING: use single = only; double == replaces the entire
+ *     java.security file and breaks SSL/TLS.
  * </pre>
  */
 public final class FipsAuditProvider extends Provider {
@@ -50,6 +71,64 @@ public final class FipsAuditProvider extends Provider {
     private static final String VERSION = "1.0";
     private static final String INFO    =
             "FIPS Audit Bridge: logs non-FIPS JCA usage and delegates to native providers";
+
+    // -- Configuration -------------------------------------------------------
+    //
+    //  Settings are resolved in order:
+    //    1. System property  (-Dfips.audit.log=...)
+    //    2. Config file      (<java.home>/conf/fips-audit.properties)
+    //    3. Built-in default
+    //
+    //  The config file is loaded once on first access.  When deployed via
+    //  the JRE patch approach, the file lives inside the patched JRE and
+    //  can be edited without recompilation.
+    //
+
+    private static final String CONFIG_FILE = "fips-audit.properties";
+    private static volatile Properties configProps;
+
+    /**
+     * Returns the effective value for a configuration key.
+     * Checks system properties first, then the config file, then the default.
+     */
+    static String config(String key, String defaultValue) {
+        // 1. System property takes priority (allows -D override)
+        String val = System.getProperty(key);
+        if (val != null) return val.trim();
+
+        // 2. Config file
+        Properties props = loadConfig();
+        val = props.getProperty(key);
+        if (val != null) return val.trim();
+
+        // 3. Built-in default
+        return defaultValue;
+    }
+
+    private static Properties loadConfig() {
+        Properties p = configProps;
+        if (p != null) return p;
+
+        p = new Properties();
+        try {
+            // Look in <java.home>/conf/fips-audit.properties
+            String javaHome = System.getProperty("java.home");
+            if (javaHome != null) {
+                File f = new File(javaHome, "conf" + File.separator + CONFIG_FILE);
+                if (f.isFile()) {
+                    try (FileInputStream fis = new FileInputStream(f)) {
+                        p.load(fis);
+                    }
+                    System.err.println("[FipsAudit] Config loaded: " + f.getAbsolutePath()
+                            + " (" + p.size() + " entries)");
+                }
+            }
+        } catch (Throwable t) {
+            System.err.println("[FipsAudit] WARNING: cannot load config file: " + t);
+        }
+        configProps = p;  // benign race -- Properties is read-only after load
+        return p;
+    }
 
     /**
      * Re-entrancy guard: depth counter tracking nested entries into
@@ -79,9 +158,9 @@ public final class FipsAuditProvider extends Provider {
     // ── BCFIPS management ──────────────────────────────────────────────
 
     /**
-     * Register the BouncyCastleFipsProvider instance that this provider
-     * uses as the FIPS-compliance oracle.  Not required &mdash; if omitted,
-     * BCFIPS is auto-initialised on first use from the classpath.
+     * Register a pre-constructed BouncyCastleFipsProvider instance as the
+     * FIPS-compliance oracle.  Optional &mdash; if not called, BCFIPS is
+     * auto-initialised from the classpath on first use.
      */
     public static void setBcfipsProvider(Provider bcfips) {
         bcfipsInstance = bcfips;
@@ -95,61 +174,210 @@ public final class FipsAuditProvider extends Provider {
     }
 
     /**
-     * Lazily creates and configures a BouncyCastleFipsProvider instance.
-     * Called automatically on the first {@code getService()} invocation
-     * when {@link #setBcfipsProvider} was not called explicitly.
+     * Lazily creates a BouncyCastleFipsProvider instance for use as a
+     * FIPS-compliance oracle.  The instance is <em>not</em> registered in
+     * the JCA provider chain &mdash; it is only used to probe whether an
+     * algorithm is FIPS-approved.
+     *
+     * <p>This method is <b>lock-free</b> to avoid deadlocks with JCA's
+     * internal locks.  If two threads race to initialise BCFIPS, one wins
+     * the CAS and does the work; the other skips Layer&nbsp;1 for that
+     * single call (and will pick up the result on the next call).</p>
+     *
+     * <p>If construction fails for any reason (class not on classpath,
+     * BCFIPS internal error, etc.) the failure is logged once and
+     * subsequent calls return {@code null} immediately, falling back
+     * to policy-file-only mode.</p>
      */
-    private static synchronized Provider autoInitBcfips() {
+    private static final int INIT_NOT_STARTED = 0;
+    private static final int INIT_IN_PROGRESS = 1;
+    private static final int INIT_DONE        = 2;
+    private static final int INIT_FAILED      = 3;
+    private static final AtomicInteger bcfipsInitState = new AtomicInteger(INIT_NOT_STARTED);
+
+    /**
+     * Default directory (relative to {@code java.home}) where the unmodified
+     * {@code bc-fips-*.jar} can be placed for automatic discovery when the
+     * audit provider is embedded in a JRE image via {@code jlink}.
+     *
+     * <p>This avoids the need for {@code -Xbootclasspath/a} or any
+     * command-line / environment variable configuration &mdash; ideal for
+     * JNI-embedded JVMs where the C++ launcher calls
+     * {@code JNI_CreateJavaVM} directly.</p>
+     */
+    private static final String BCFIPS_LIB_DIR = "lib" + File.separator + "fips";
+
+    private static Provider autoInitBcfips() {
         Provider p = bcfipsInstance;
         if (p != null) return p;
+
+        // Non-blocking: if another thread is already initialising, skip
+        // Layer 1 for this one call rather than blocking (which deadlocks
+        // with JCA's internal locks).
+        int state = bcfipsInitState.get();
+        if (state == INIT_FAILED) return null;
+        if (state == INIT_IN_PROGRESS) return null;
+        if (!bcfipsInitState.compareAndSet(INIT_NOT_STARTED, INIT_IN_PROGRESS)) {
+            return bcfipsInstance;   // another thread just finished or is in progress
+        }
+
         try {
-            Class<?> cls = Class.forName(
-                    "org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider");
+            // Ensure BCFIPS runs in approved-only mode so getService()
+            // returns null for non-FIPS algorithms.  This property must
+            // be set BEFORE the BouncyCastleFipsProvider constructor runs.
+            // If already set (e.g. via -D flag or JAVA_TOOL_OPTIONS), we
+            // leave the existing value untouched.
+            if (System.getProperty("org.bouncycastle.fips.approved_only") == null) {
+                System.setProperty("org.bouncycastle.fips.approved_only", "true");
+                System.err.println("[FipsAudit] Set org.bouncycastle.fips.approved_only=true");
+            }
+
+            // Strategy 1: try the current classloader (works when bc-fips is
+            //             on the bootclasspath via -Xbootclasspath/a or the
+            //             application classpath)
+            Class<?> cls = null;
+            try {
+                cls = Class.forName(
+                        "org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider");
+            } catch (ClassNotFoundException ignored) {
+                // Not on classpath — fall through to Strategy 2
+            }
+
+            // Strategy 2: scan <java.home>/lib/fips/ for bc-fips-*.jar and
+            //             load via URLClassLoader.  This is the primary path
+            //             when the audit provider is jlinked into a JRE and
+            //             bc-fips.jar is dropped into lib/fips/.
+            if (cls == null) {
+                cls = loadBcfipsFromJreLib();
+            }
+
+            if (cls == null) {
+                throw new ClassNotFoundException(
+                        "BouncyCastleFipsProvider not found on classpath or in "
+                        + BCFIPS_LIB_DIR);
+            }
+
             p = (Provider) cls.getDeclaredConstructor().newInstance();
             bcfipsInstance = p;
+            bcfipsInitState.set(INIT_DONE);
             System.err.println("[FipsAudit] BCFIPS auto-initialised: "
                     + p.getName() + " v" + p.getVersion()
                     + " (FIPS oracle - NOT in JCA chain)");
-        } catch (Exception e) {
-            System.err.println("[FipsAudit] WARNING: bc-fips not on classpath - "
-                    + "audit limited to policy-file rules only: " + e);
+        } catch (Throwable t) {
+            bcfipsInitState.set(INIT_FAILED);
+            System.err.println("[FipsAudit] WARNING: cannot initialise BCFIPS - "
+                    + "audit limited to policy-file rules only: " + t);
         }
         return p;
     }
 
+    /**
+     * Scans {@code <java.home>/lib/fips/} for JARs matching
+     * {@code bc-fips*.jar} and loads {@code BouncyCastleFipsProvider}
+     * via a dedicated {@link URLClassLoader}.
+     *
+     * <p>The bc-fips JAR is loaded <em>unmodified</em>, preserving its
+     * FIPS self-integrity checksum.  The URLClassLoader is kept alive
+     * (referenced by the loaded class) for the lifetime of the JVM.</p>
+     *
+     * @return the {@code BouncyCastleFipsProvider} class, or {@code null}
+     */
+    private static Class<?> loadBcfipsFromJreLib() {
+        try {
+            String javaHome = System.getProperty("java.home");
+            if (javaHome == null) return null;
+
+            File fipsDir = new File(javaHome, BCFIPS_LIB_DIR);
+            if (!fipsDir.isDirectory()) {
+                System.err.println("[FipsAudit] BCFIPS lib dir not found: "
+                        + fipsDir.getAbsolutePath()
+                        + " — Layer 1 (BCFIPS probe) disabled");
+                return null;
+            }
+
+            // Collect all JARs in the fips directory
+            File[] jars = fipsDir.listFiles(
+                    (dir, name) -> name.toLowerCase().endsWith(".jar"));
+            if (jars == null || jars.length == 0) {
+                System.err.println("[FipsAudit] No JARs in "
+                        + fipsDir.getAbsolutePath()
+                        + " — Layer 1 (BCFIPS probe) disabled");
+                return null;
+            }
+
+            URL[] urls = new URL[jars.length];
+            for (int i = 0; i < jars.length; i++) {
+                urls[i] = jars[i].toURI().toURL();
+                System.err.println("[FipsAudit] Loading BCFIPS JAR: "
+                        + jars[i].getName());
+            }
+
+            // Parent = platform class loader so bc-fips can see java.base,
+            // java.security.Provider, etc. but not application classes.
+            URLClassLoader cl = new URLClassLoader(
+                    urls, ClassLoader.getPlatformClassLoader());
+
+            return Class.forName(
+                    "org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider",
+                    true, cl);
+        } catch (Throwable t) {
+            System.err.println("[FipsAudit] WARNING: failed to load BCFIPS "
+                    + "from " + BCFIPS_LIB_DIR + ": " + t);
+            return null;
+        }
+    }
+
     // ── Policy engine ──────────────────────────────────────────────────
+    //
+    //  Lock-free lazy init: FipsPolicy is immutable after construction,
+    //  so a benign data race (two threads creating separate instances,
+    //  one discarded by GC) is safe and avoids deadlocking with JCA's
+    //  internal locks.
+    //
 
     static FipsPolicy policy() {
-        if (fipsPolicy == null) {
-            synchronized (FipsAuditProvider.class) {
-                if (fipsPolicy == null) {
-                    fipsPolicy = new FipsPolicy();
-                }
-            }
+        FipsPolicy p = fipsPolicy;
+        if (p == null) {
+            p = new FipsPolicy();
+            fipsPolicy = p;   // benign race — FipsPolicy is read-only
         }
-        return fipsPolicy;
+        return p;
     }
 
     // ── Audit logger ───────────────────────────────────────────────────
+    //
+    //  Lock-free lazy init: the Logger and its handlers are append-only
+    //  after setup.  A benign race may create duplicate handlers once,
+    //  but that is harmless and avoids deadlocking with JCA's internal
+    //  locks (which are held while JCA calls our getService).
+    //
 
     private static volatile Logger auditLog;
     private static volatile int stackDepth;
 
     static Logger auditLogger() {
-        if (auditLog == null) {
-            synchronized (FipsAuditProvider.class) {
-                if (auditLog == null) {
-                    stackDepth = Integer.parseInt(
-                            System.getProperty("fips.audit.stack.depth", "20"));
-                    auditLog = buildLogger();
-                }
-            }
+        Logger log = auditLog;
+        if (log == null) {
+            stackDepth = safeParseInt(
+                    config("fips.audit.stack.depth", "20"), 20);
+            log = buildLogger();
+            auditLog = log;   // benign race -- Logger is thread-safe
         }
-        return auditLog;
+        return log;
+    }
+
+    private static int safeParseInt(String value, int fallback) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            System.err.println("[FipsAudit] WARNING: invalid integer '" + value
+                    + "', using default " + fallback);
+            return fallback;
+        }
     }
 
     private static Logger buildLogger() {
-        String logFile = System.getProperty("fips.audit.log", "fips-audit.log");
+        String logFile = config("fips.audit.log", "fips-audit.log");
         Logger log = Logger.getLogger("com.demo.fips.audit");
         log.setUseParentHandlers(false);
         log.setLevel(Level.ALL);
@@ -170,6 +398,41 @@ public final class FipsAuditProvider extends Provider {
                     + logFile + "': " + e.getMessage() + " - stderr only");
         }
         return log;
+    }
+
+    // ── Java Agent entry points ─────────────────────────────────────
+    //
+    //  When loaded as a Java agent (-javaagent:fips-audit-provider.jar),
+    //  premain() inserts this provider at JCA position 1 before the
+    //  application's main() method runs.  This avoids manipulating
+    //  java.security / security-audit.properties entirely, so all JDK
+    //  default security settings (SSL/TLS, keystores, etc.) remain intact.
+    //
+
+    /**
+     * Java agent entry point &mdash; called before {@code main()}.
+     * Inserts this provider at JCA position 1.
+     */
+    public static void premain(String agentArgs, Instrumentation inst) {
+        installProvider();
+    }
+
+    /**
+     * Dynamic-attach agent entry point &mdash; called when attaching to a
+     * running JVM via the Attach API.
+     */
+    public static void agentmain(String agentArgs, Instrumentation inst) {
+        installProvider();
+    }
+
+    private static void installProvider() {
+        try {
+            FipsAuditProvider provider = new FipsAuditProvider();
+            Security.insertProviderAt(provider, 1);
+            System.err.println("[FipsAudit] Provider installed at JCA position 1 (via agent)");
+        } catch (Throwable t) {
+            System.err.println("[FipsAudit] ERROR: failed to install provider: " + t);
+        }
     }
 
     // ── Constructor ────────────────────────────────────────────────────
@@ -215,181 +478,138 @@ public final class FipsAuditProvider extends Provider {
 
         DEPTH.set(depth + 1);
         try {
-            Provider bcfips = bcfipsInstance;
-            if (bcfips == null) {
-                bcfips = autoInitBcfips();
-                if (bcfips == null) return null;
-            }
-
-            // ── BCFIPS probe: is this algorithm FIPS-approved? ──
-            boolean fipsApproved = bcfips.getService(type, algorithm) != null;
-
-            if (fipsApproved) {
-                // BCFIPS recognises the algorithm - wrap for policy check
-                return new AuditService(this, type, algorithm, true);
-            }
-
-            // BCFIPS does not recognise it - find a native provider
-            for (Provider p : Security.getProviders()) {
-                if (NAME.equals(p.getName()) || p == bcfips) continue;
-                if (p.getService(type, algorithm) != null) {
-                    return new AuditService(this, type, algorithm, false);
-                }
-            }
-
-            return null;   // no provider supports it at all
+            performAudit(type, algorithm);
+        } catch (Throwable t) {
+            // Catch Throwable (not just Exception) because BCFIPS can
+            // throw Error subclasses (FipsOperationError, AssertionError).
+            // Audit must NEVER affect the application.
+            System.err.println("[FipsAudit] WARNING: audit failed for "
+                    + type + "/" + algorithm + ": " + t);
         } finally {
             DEPTH.set(depth);
         }
+
+        // Always return null — let JCA resolve the real provider naturally.
+        // This ensures the audit layer never interferes with provider
+        // selection, SSL/TLS context creation, or any other JCA operation.
+        return null;
     }
 
-    // ── AuditService ───────────────────────────────────────────────────
+    // ── Audit logic (fire-and-forget, never blocks JCA) ────────────────
 
-    static final class AuditService extends Provider.Service {
+    private void performAudit(String type, String algorithm) {
+        // Retrieve cipher transformation captured in earlier getService() call
+        String fullTransform = PENDING_CIPHER_TRANSFORM.get();
+        PENDING_CIPHER_TRANSFORM.remove();
 
-        /** True when BCFIPS recognises the algorithm (FIPS-approved). */
-        private final boolean fipsApproved;
-
-        AuditService(Provider provider, String type, String algorithm,
-                     boolean fipsApproved) {
-            super(provider, type, algorithm, "(native-delegation)",
-                    List.of(), null);
-            this.fipsApproved = fipsApproved;
+        Provider bcfips = bcfipsInstance;
+        if (bcfips == null) {
+            bcfips = autoInitBcfips();
         }
 
-        @Override
-        public Object newInstance(Object constructorParameter)
-                throws NoSuchAlgorithmException {
-
-            int depth = DEPTH.get();
-            DEPTH.set(depth + 1);
+        // ── Layer 1: BCFIPS oracle (auto-initialised or via setBcfipsProvider) ──
+        boolean fipsApproved = true;   // assume approved if no BCFIPS
+        if (bcfips != null) {
             try {
-                // Retrieve cipher transformation captured in getService()
-                String fullTransform = PENDING_CIPHER_TRANSFORM.get();
-                PENDING_CIPHER_TRANSFORM.remove();
-
-                // ── Layer 1: BCFIPS oracle ──
-                if (!fipsApproved) {
-                    String displayAlgo = fullTransform != null
-                            ? fullTransform : getAlgorithm();
-                    logAudit("DISALLOWED", getType(), displayAlgo,
-                            "Algorithm not available in BCFIPS approved-only mode");
-                    return delegateToNative(getType(), getAlgorithm(),
-                            constructorParameter);
-                }
-
-                // ── Layer 2: Policy file ──
-                String mode    = null;
-                String padding = null;
-                if (fullTransform != null) {
-                    String[] parts = fullTransform.split("/");
-                    if (parts.length >= 2) mode    = parts[1];
-                    if (parts.length >= 3) padding = parts[2];
-                }
-
-                FipsPolicy.PolicyResult result =
-                        policy().lookup(getType(), getAlgorithm(), mode, padding);
-
-                if (result.classification() != FipsPolicy.Classification.APPROVED) {
-                    String label = result.classification().name();
-                    String algo  = fullTransform != null
-                            ? fullTransform : getAlgorithm();
-                    String reason = result.reason() != null
-                            ? result.reason()
-                            : label + " per fips-policy.properties";
-                    logAudit(label, getType(), algo, reason);
-                    return delegateToNative(getType(), getAlgorithm(),
-                            constructorParameter);
-                }
-
-                // APPROVED - silent delegation, no audit entry
-                return delegateToNativeSilent(getType(), getAlgorithm(),
-                        constructorParameter);
-
-            } finally {
-                DEPTH.set(depth);
-                PENDING_CIPHER_TRANSFORM.remove();   // always clean up
+                fipsApproved = bcfips.getService(type, algorithm) != null;
+            } catch (Throwable t) {
+                // Catch Throwable — BCFIPS can throw Error subclasses
+                System.err.println("[FipsAudit] WARNING: BCFIPS probe failed for "
+                        + type + "/" + algorithm + ": " + t);
+                return;   // cannot determine status — skip audit
             }
         }
 
-        // ── Audit logging ──────────────────────────────────────────────
-
-        static void logAudit(String classification, String type,
-                             String algorithm, String reason) {
-            Logger log = auditLogger();
-            StackTraceElement[] frames = Thread.currentThread().getStackTrace();
-            StringBuilder sb = new StringBuilder();
-            sb.append("FIPS AUDIT - ").append(classification).append('\n');
-            sb.append("  Timestamp : ").append(Instant.now()).append('\n');
-            sb.append("  JCA type  : ").append(type).append('\n');
-            sb.append("  Algorithm : ").append(algorithm).append('\n');
-            sb.append("  Reason    : ").append(reason).append('\n');
-            sb.append("  Caller stack (application frames):\n");
-            int printed = 0;
-            int limit = stackDepth > 0 ? stackDepth : 20;
-            for (StackTraceElement f : frames) {
-                String cls = f.getClassName();
-                if (cls.startsWith("java.") || cls.startsWith("javax.")
-                        || cls.startsWith("jdk.") || cls.startsWith("sun.")
-                        || cls.startsWith("com.demo.fips.audit.")) continue;
-                sb.append("    at ").append(f).append('\n');
-                if (++printed >= limit) {
-                    sb.append("    ... (truncated)\n");
-                    break;
-                }
-            }
-            log.warning(sb.toString());
+        if (!fipsApproved) {
+            String displayAlgo = fullTransform != null ? fullTransform : algorithm;
+            logAudit("DISALLOWED", type, displayAlgo,
+                    "Algorithm not available in BCFIPS approved-only mode");
+            return;
         }
 
-        // ── Native delegation (with audit log of target) ──────────────
-
-        private static Object delegateToNative(String type, String algorithm,
-                Object param) throws NoSuchAlgorithmException {
-            List<String> tried = new ArrayList<>();
-            for (Provider p : Security.getProviders()) {
-                String n = p.getName();
-                if (NAME.equals(n) || "BCFIPS".equals(n)) continue;
-                Provider.Service svc = p.getService(type, algorithm);
-                if (svc == null) continue;
-                try {
-                    Object instance = svc.newInstance(param);
-                    auditLogger().info("  -> delegated " + type + "/"
-                            + algorithm + " to [" + n + "]");
-                    return instance;
-                } catch (Exception ex) {
-                    tried.add(n + "(" + ex.getMessage() + ")");
-                }
-            }
-            throw new NoSuchAlgorithmException(
-                    "No provider supports " + type + "/" + algorithm
-                    + "; tried: " + tried);
+        // ── Layer 2: Policy file ──
+        String mode    = null;
+        String padding = null;
+        if (fullTransform != null) {
+            String[] parts = fullTransform.split("/");
+            if (parts.length >= 2) mode    = parts[1];
+            if (parts.length >= 3) padding = parts[2];
         }
 
-        /**
-         * Silent delegation &mdash; no audit log entry.
-         * Used for FIPS-approved algorithms with no policy concerns.
-         */
-        private static Object delegateToNativeSilent(String type,
-                String algorithm, Object param)
-                throws NoSuchAlgorithmException {
-            int depth = DEPTH.get();
-            DEPTH.set(depth + 1);
-            try {
-                for (Provider p : Security.getProviders()) {
-                    String n = p.getName();
-                    if (NAME.equals(n) || "BCFIPS".equals(n)) continue;
-                    Provider.Service svc = p.getService(type, algorithm);
-                    if (svc == null) continue;
-                    try {
-                        return svc.newInstance(param);
-                    } catch (Exception ignored) { }
-                }
-            } finally {
-                DEPTH.set(depth);
-            }
-            throw new NoSuchAlgorithmException(
-                    "No native provider supports " + type + "/" + algorithm);
+        FipsPolicy.PolicyResult result =
+                policy().lookup(type, algorithm, mode, padding);
+
+        if (result.classification() != FipsPolicy.Classification.APPROVED) {
+            String label  = result.classification().name();
+            String algo   = fullTransform != null ? fullTransform : algorithm;
+            String reason = result.reason() != null
+                    ? result.reason()
+                    : label + " per fips-policy.properties";
+            logAudit(label, type, algo, reason);
         }
+    }
+
+    // ── Deduplication ───────────────────────────────────────────────
+    //
+    // Keyed on classification + type + algorithm + first app-level
+    // caller frame.  Controlled by -Dfips.audit.dedupe (default true).
+    //
+
+    private static final Set<String> SEEN_AUDITS =
+            ConcurrentHashMap.newKeySet();
+
+    private static final boolean DEDUPE_ENABLED =
+            !"false".equalsIgnoreCase(
+                    config("fips.audit.dedupe", "true"));
+
+    // ── Audit logging ──────────────────────────────────────────────────
+
+    static void logAudit(String classification, String type,
+                         String algorithm, String reason) {
+        Logger log = auditLogger();
+        StackTraceElement[] frames = Thread.currentThread().getStackTrace();
+
+        // Find the first application-level caller frame for dedup key
+        String callerOrigin = "";
+        for (StackTraceElement f : frames) {
+            String cls = f.getClassName();
+            if (cls.startsWith("java.") || cls.startsWith("javax.")
+                    || cls.startsWith("jdk.") || cls.startsWith("sun.")
+                    || cls.startsWith("com.demo.fips.audit.")) continue;
+            callerOrigin = f.toString();
+            break;
+        }
+
+        if (DEDUPE_ENABLED) {
+            String dedupeKey = classification + "|" + type + "|" + algorithm
+                    + "|" + callerOrigin;
+            if (!SEEN_AUDITS.add(dedupeKey)) {
+                // Already logged for this exact origin — skip
+                return;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("FIPS AUDIT - ").append(classification).append('\n');
+       // sb.append("  Timestamp : ").append(Instant.now()).append('\n');
+        sb.append("  JCA type  : ").append(type).append('\n');
+        sb.append("  Algorithm : ").append(algorithm).append('\n');
+        sb.append("  Reason    : ").append(reason).append('\n');
+        sb.append("  Caller stack (application frames):\n");
+        int printed = 0;
+        int limit = stackDepth > 0 ? stackDepth : 20;
+        for (StackTraceElement f : frames) {
+            String cls = f.getClassName();
+            if (cls.startsWith("java.") || cls.startsWith("javax.")
+                    || cls.startsWith("jdk.") || cls.startsWith("sun.")
+                    || cls.startsWith("com.demo.fips.audit.")) continue;
+            sb.append("    at ").append(f).append('\n');
+            if (++printed >= limit) {
+                sb.append("    ... (truncated)\n");
+                break;
+            }
+        }
+        log.warning(sb.toString());
     }
 
     // ── Log formatter ──────────────────────────────────────────────────
